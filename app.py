@@ -11,12 +11,11 @@ st.title("⛈️ Quantitative Weather Arbitrage Scanner")
 st.markdown("ECMWF 50-Member Ensemble Probability vs. Kalshi KXHIGH Contract Pricing")
 
 # --- Institutional Settlement Coordinates ---
-# Kalshi weather markets settle to specific NWS airport stations, not generic city coordinates.
 STATIONS = {
-    "Chicago (KXHIGHCHI)": {"lat": 41.7868, "lon": -87.7522, "airport": "Midway (KMDW)"},
-    "New York (KXHIGHNY)": {"lat": 40.7829, "lon": -73.9654, "airport": "Central Park (KNYC)"},
-    "Austin (KXHIGHAUS)": {"lat": 30.1945, "lon": -97.6699, "airport": "Bergstrom (KAUS)"},
-    "Miami (KXHIGHMIA)": {"lat": 25.7959, "lon": -80.2870, "airport": "Miami Int (KMIA)"}
+    "Chicago": {"lat": 41.7868, "lon": -87.7522, "airport": "Midway (KMDW)", "ticker": "KXHIGHCHI"},
+    "New York": {"lat": 40.7829, "lon": -73.9654, "airport": "Central Park (KNYC)", "ticker": "KXHIGHNY"},
+    "Austin": {"lat": 30.1945, "lon": -97.6699, "airport": "Bergstrom (KAUS)", "ticker": "KXHIGHAUS"},
+    "Miami": {"lat": 25.7959, "lon": -80.2870, "airport": "Miami Int (KMIA)", "ticker": "KXHIGHMIA"}
 }
 
 # --- Sidebar Parameters ---
@@ -32,7 +31,6 @@ with st.sidebar:
 # --- Helper Functions ---
 @st.cache_data(ttl=900, show_spinner=False)
 def fetch_ecmwf_ensemble(lat, lon):
-    """Pulls the free 50-member ECMWF ensemble forecast from Open-Meteo."""
     try:
         url = (
             f"https://ensemble-api.open-meteo.com/v1/ensemble?"
@@ -46,11 +44,20 @@ def fetch_ecmwf_ensemble(lat, lon):
         pass
     return None
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_kalshi_markets(series_ticker):
+    """Pulls live public markets from Kalshi without requiring authentication."""
+    try:
+        url = f"https://external-api.kalshi.com/trade-api/v2/markets?series_ticker={series_ticker}"
+        headers = {"Accept": "application/json"}
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code == 200:
+            return res.json().get("markets", [])
+    except Exception:
+        pass
+    return []
+
 def calculate_quarter_kelly(prob_model, price_cents, bankroll):
-    """
-    Calculates Quarter-Kelly bet size.
-    Price is in cents (e.g., 60 for 60%). Payout is always $1.00 (100 cents).
-    """
     p = prob_model / 100.0
     q = 1.0 - p
     b = (100.0 - price_cents) / price_cents 
@@ -60,15 +67,7 @@ def calculate_quarter_kelly(prob_model, price_cents, bankroll):
         
     kelly_fraction = (b * p - q) / b
     quarter_kelly = kelly_fraction * 0.25
-    
-    # Cap maximum exposure to 10% of bankroll for strict risk management
     return min(bankroll * quarter_kelly, bankroll * 0.10)
-
-def calculate_maker_fee(contracts, price_cents):
-    """Estimates Kalshi taker/maker fee drag."""
-    p_dec = price_cents / 100.0
-    base_fee = math.ceil(0.07 * contracts * p_dec * (1 - p_dec) * 100) / 100.0
-    return base_fee
 
 # --- Core Execution ---
 if st.button("📡 Scan Live Ensemble Discrepancies", type="primary", use_container_width=True):
@@ -76,13 +75,12 @@ if st.button("📡 Scan Live Ensemble Discrepancies", type="primary", use_contai
     status_text = st.empty()
     
     results = []
-    
-    # Target date: tomorrow
     target_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     
     for idx, (city, coords) in enumerate(STATIONS.items()):
-        status_text.text(f"Querying 50-member ECMWF models for {city}...")
+        status_text.text(f"Querying models and Kalshi order books for {city}...")
         
+        # 1. Get Weather Data
         ensemble_data = fetch_ecmwf_ensemble(coords["lat"], coords["lon"])
         if not ensemble_data or "daily" not in ensemble_data:
             continue
@@ -92,8 +90,6 @@ if st.button("📡 Scan Live Ensemble Discrepancies", type="primary", use_contai
         
         if target_date in time_list:
             date_idx = time_list.index(target_date)
-            
-            # Extract the 50 member predictions for tomorrow's high
             member_temps = []
             for key in daily.keys():
                 if key.startswith("temperature_2m_max_member"):
@@ -104,19 +100,30 @@ if st.button("📡 Scan Live Ensemble Discrepancies", type="primary", use_contai
             if not member_temps:
                 continue
                 
-            # Define an arbitrary strike price for the sake of the scanner demo
-            # In production, this pulls dynamically from Kalshi's public /v2/markets endpoint
             baseline_high = sum(member_temps) / len(member_temps)
             target_strike = math.floor(baseline_high) + 1 
             
-            # Calculate P(model)
             members_above_strike = sum(1 for t in member_temps if t >= target_strike)
             prob_model = (members_above_strike / len(member_temps)) * 100
             
-            # Simulate Kalshi Market Price (Testing Logic)
-            # A real connection uses: requests.get(f"https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker=KXHIGH...")
-            market_price = max(1, min(99, int(prob_model - 12))) # Simulating a 12% underpriced market for demonstration
+            # 2. Get Live Kalshi Data
+            kalshi_markets = fetch_kalshi_markets(coords["ticker"])
+            market_price = None
             
+            # Find the market bracket that matches our exact strike
+            for m in kalshi_markets:
+                subtitle = m.get("subtitle", "")
+                if str(target_strike) in subtitle:
+                    market_price = m.get("yes_ask", 0)
+                    break
+            
+            # Fallback to simulated data if Kalshi doesn't have an active bracket for that exact degree yet
+            if not market_price or market_price == 0:
+                market_price = max(1, min(99, int(prob_model - 12)))
+                price_label = f"{market_price}¢ (Simulated)"
+            else:
+                price_label = f"{market_price}¢ (Live Orderbook)"
+                
             edge = prob_model - market_price
             
             if edge >= min_edge:
@@ -133,9 +140,9 @@ if st.button("📡 Scan Live Ensemble Discrepancies", type="primary", use_contai
                 "Target Market": f"{city} ≥ {target_strike}°F",
                 "Settlement Station": coords["airport"],
                 "Model P(True)": f"{prob_model:.1f}%",
-                "Kalshi Ask Price": f"{market_price}¢",
+                "Kalshi Ask Price": price_label,
                 "Raw Edge": f"{edge:+.1f}%",
-                "Quarter-Kelly Allocation": f"${bet_size:,.2f}" if bet_size > 0 else "$0.00",
+                "Quarter-Kelly": f"${bet_size:,.2f}" if bet_size > 0 else "$0.00",
                 "Verdict": verdict,
                 "_raw_edge": abs(edge),
                 "_member_temps": member_temps
@@ -153,9 +160,7 @@ if st.button("📡 Scan Live Ensemble Discrepancies", type="primary", use_contai
         
         st.markdown("---")
         st.subheader("📊 ECMWF 50-Member Distribution")
-        st.markdown("Visualize the raw ensemble spread to ensure the probability isn't skewed by a single outlier model.")
         
-        # Plot the distribution of the highest-edge opportunity
         top_opportunity = df.iloc[0]
         temps = top_opportunity["_member_temps"]
         
