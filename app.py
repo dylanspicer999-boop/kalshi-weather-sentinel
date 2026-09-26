@@ -48,9 +48,9 @@ def fetch_super_ensemble(lat, lon, tz):
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_kalshi_markets(series_ticker):
-    """Pulls live public markets from Kalshi without requiring authentication."""
+    """Pulls live public markets from Kalshi using the primary public routing gateway."""
     try:
-        url = f"https://trading-api.kalshi.com/trade-api/v2/markets?series_ticker={series_ticker}"
+        url = f"https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker={series_ticker}"
         headers = {"Accept": "application/json"}
         res = requests.get(url, headers=headers, timeout=10)
         if res.status_code == 200:
