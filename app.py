@@ -1,54 +1,43 @@
 import streamlit as st
 import requests
 import pandas as pd
-import math
-import plotly.express as px
-from datetime import datetime, timedelta
+from datetime import datetime
+import pytz
 
-# --- UI Configuration ---
-st.set_page_config(page_title="Kalshi Weather Sentinel | Core Engine V2", page_icon="⛈️", layout="wide")
-st.title("⛈️ Quantitative Weather Arbitrage Scanner V2")
-st.markdown("81-Member Super-Ensemble (ECMWF + NOAA GEFS) vs. True Kalshi Order Book Spreads")
+st.set_page_config(page_title="Kalshi Weather V3 | Diurnal Sniper", page_icon="🎯", layout="wide")
+st.title("🎯 Diurnal Weather Sniper V3")
+st.markdown("Settlement-Lag Arbitrage via AviationWeather METAR & Kalshi Limit Books")
 
-# --- Institutional Settlement Coordinates & Timezones ---
-# NWS stations settle strictly on local time midnight-to-midnight. UTC ruins the model.
+# --- V3 Station Data ---
 STATIONS = {
-    "Chicago": {"lat": 41.7868, "lon": -87.7522, "airport": "Midway (KMDW)", "ticker": "KXHIGHCHI", "tz": "America/Chicago"},
-    "New York": {"lat": 40.7829, "lon": -73.9654, "airport": "Central Park (KNYC)", "ticker": "KXHIGHNY", "tz": "America/New_York"},
-    "Austin": {"lat": 30.1945, "lon": -97.6699, "airport": "Bergstrom (KAUS)", "ticker": "KXHIGHAUS", "tz": "America/Chicago"},
-    "Miami": {"lat": 25.7959, "lon": -80.2870, "airport": "Miami Int (KMIA)", "ticker": "KXHIGHMIA", "tz": "America/New_York"}
+    "Chicago": {"icao": "KMDW", "ticker": "KXHIGHCHI", "tz": "America/Chicago"},
+    "New York": {"icao": "KNYC", "ticker": "KXHIGHNY", "tz": "America/New_York"},
+    "Austin": {"icao": "KAUS", "ticker": "KXHIGHAUS", "tz": "America/Chicago"},
+    "Miami": {"icao": "KMIA", "ticker": "KXHIGHMIA", "tz": "America/New_York"}
 }
 
-# --- Sidebar Parameters ---
 with st.sidebar:
-    st.header("⚙️ Risk & Execution Parameters")
+    st.header("⚙️ Sniper Parameters")
     bankroll = st.number_input("Total Bankroll ($)", min_value=100, value=1000, step=100)
-    min_edge = st.slider("Minimum Edge Required (%)", min_value=2, max_value=20, value=6, step=1)
-    
-    st.markdown("---")
-    st.markdown("**Quarter-Kelly Constraints:**")
-    st.markdown("Position sizing is strictly capped at 25% of the theoretical Kelly Criterion to prevent ruin during model variance.")
+    max_no_price = st.slider("Max 'NO' Bid Limit (¢)", min_value=70, max_value=95, value=93, step=1, help="Do not buy tails above 95¢. Kelly sizing becomes toxic.")
+    temp_drop_threshold = st.slider("Required Temp Drop from Peak (°C)", min_value=0.5, max_value=3.0, value=1.0, step=0.1)
 
-# --- Helper Functions ---
-@st.cache_data(ttl=900, show_spinner=False)
-def fetch_super_ensemble(lat, lon, tz):
-    """Pulls an 81-member blended super-ensemble (50 ECMWF + 31 NOAA GEFS)."""
+# --- V3 API Handlers ---
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_metar_data(icao):
+    """Pulls the last 12 hours of FAA ASOS readings directly from aviationweather.gov"""
     try:
-        url = (
-            f"https://ensemble-api.open-meteo.com/v1/ensemble?"
-            f"latitude={lat}&longitude={lon}&daily=temperature_2m_max&"
-            f"models=ecmwf_ifs025,gfs_seamless&temperature_unit=fahrenheit&timezone={tz}"
-        )
+        url = f"https://aviationweather.gov/api/data/metar?ids={icao}&format=json&hours=12"
         res = requests.get(url, timeout=10)
         if res.status_code == 200:
             return res.json()
     except Exception:
         pass
-    return None
+    return []
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_kalshi_markets(series_ticker):
-    """Pulls live public markets from Kalshi using the primary public routing gateway."""
+    """Pulls live Kalshi order books via the primary elections gateway"""
     try:
         url = f"https://api.elections.kalshi.com/trade-api/v2/markets?series_ticker={series_ticker}"
         headers = {"Accept": "application/json"}
@@ -59,140 +48,94 @@ def fetch_kalshi_markets(series_ticker):
         pass
     return []
 
+def celsius_to_fahrenheit(c):
+    return (c * 9/5) + 32
+
 def calculate_quarter_kelly(prob_model, execution_price_cents, bankroll):
     p = prob_model / 100.0
     q = 1.0 - p
     b = (100.0 - execution_price_cents) / execution_price_cents 
-    
-    if p * 100 <= execution_price_cents or b <= 0:
-        return 0.0
-        
-    kelly_fraction = (b * p - q) / b
-    quarter_kelly = kelly_fraction * 0.25
-    return min(bankroll * quarter_kelly, bankroll * 0.10)
+    if p * 100 <= execution_price_cents or b <= 0: return 0.0
+    return min(bankroll * ((b * p - q) / b) * 0.25, bankroll * 0.10)
 
 # --- Core Execution ---
-if st.button("📡 Execute High-Fidelity Market Scan", type="primary", use_container_width=True):
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
+if st.button("🔭 Scan Diurnal Lock-Ins", type="primary", use_container_width=True):
+    progress = st.progress(0)
     results = []
-    # Target date: tomorrow
-    target_date = (datetime.now() + timedelta(days=1)).strftime("%Y-%m-%d")
     
-    for idx, (city, coords) in enumerate(STATIONS.items()):
-        status_text.text(f"Querying 81-Member Super-Ensemble & Kalshi Order Books for {city}...")
+    for idx, (city, data) in enumerate(STATIONS.items()):
+        local_tz = pytz.timezone(data["tz"])
+        local_time = datetime.now(local_tz)
         
-        # 1. Fetch High-Fidelity Weather Data
-        ensemble_data = fetch_super_ensemble(coords["lat"], coords["lon"], coords["tz"])
-        if not ensemble_data or "daily" not in ensemble_data:
+        # 1. Process METAR Data (True settlement conditions)
+        metar_logs = fetch_metar_data(data["icao"])
+        if not metar_logs:
             continue
             
-        daily = ensemble_data["daily"]
-        time_list = daily.get("time", [])
-        
-        if target_date in time_list:
-            date_idx = time_list.index(target_date)
-            member_temps = []
+        temps_c = [log.get("temp") for log in metar_logs if log.get("temp") is not None]
+        if not temps_c:
+            continue
             
-            # Extract all 81 members (ECMWF + GFS)
-            for key in daily.keys():
-                if key.startswith("temperature_2m_max_member"):
-                    temp = daily[key][date_idx]
-                    if temp is not None:
-                        member_temps.append(temp)
-                        
-            if len(member_temps) < 10:
+        running_high_c = max(temps_c)
+        running_high_f = round(celsius_to_fahrenheit(running_high_c), 1)
+        
+        current_temp_c = temps_c[0] # The most recent observation is first
+        current_temp_f = round(celsius_to_fahrenheit(current_temp_c), 1)
+        
+        # Check Diurnal Rules: Must be afternoon AND dropping
+        is_afternoon = local_time.hour >= 14 # After 2:00 PM local
+        is_dropping = (running_high_c - current_temp_c) >= temp_drop_threshold
+        
+        locked_in = is_afternoon and is_dropping
+        
+        # 2. Parse Kalshi Order Book
+        kalshi_markets = fetch_kalshi_markets(data["ticker"])
+        
+        for m in kalshi_markets:
+            floor_strike = m.get("floor_strike")
+            if not floor_strike:
                 continue
                 
-            baseline_high = sum(member_temps) / len(member_temps)
-            target_strike = math.floor(baseline_high) + 1 
-            
-            members_above_strike = sum(1 for t in member_temps if t >= target_strike)
-            prob_model = (members_above_strike / len(member_temps)) * 100
-            
-            # 2. Extract True Kalshi Order Book Data
-            kalshi_markets = fetch_kalshi_markets(coords["ticker"])
-            best_bid = 0
-            best_ask = 100
-            market_found = False
-            
-            for m in kalshi_markets:
-                subtitle = m.get("subtitle", "")
-                # Find the bracket that matches our target strike
-                if str(target_strike) in subtitle and ("or above" in subtitle or "to" in subtitle):
-                    best_bid = m.get("yes_bid", 0)
-                    best_ask = m.get("yes_ask", 100)
-                    market_found = True
-                    break
-            
-            if not market_found:
-                # If Kalshi hasn't opened tomorrow's exact brackets yet, we skip. No fake data.
-                continue
+            # If the Kalshi strike is HIGHER than today's physical running high, and temps are dropping...
+            # The YES side is mathematically dead. The NO side is a lock.
+            if floor_strike > running_high_f:
                 
-            # 3. Maker vs Taker Execution Logic
-            spread = best_ask - best_bid
-            if spread > 1 and best_bid > 0:
-                # Wide spread: front-run the bid to act as Maker and save fees
-                exec_price = best_bid + 1
-                exec_type = "Maker (Resting Limit)"
-            else:
-                # Tight spread: hit the ask
-                exec_price = best_ask
-                exec_type = "Taker (Market Order)"
+                # Extract live cents from dollar strings
+                yes_bid = int(round(float(m.get("yes_bid_dollars") or "0") * 100))
+                yes_ask = int(round(float(m.get("yes_ask_dollars") or "1") * 100))
                 
-            edge = prob_model - exec_price
-            
-            if edge >= min_edge:
-                bet_size = calculate_quarter_kelly(prob_model, exec_price, bankroll)
-                verdict = f"🟢 BUY YES @ {exec_price}¢"
-            elif edge <= -min_edge:
-                # Invert logic for the NO side
-                no_prob = 100 - prob_model
-                no_price = 100 - best_bid # buying NO means hitting the yes_bid
-                bet_size = calculate_quarter_kelly(no_prob, no_price, bankroll)
-                verdict = f"🔴 BUY NO @ {no_price}¢"
-            else:
-                bet_size = 0.0
-                verdict = "⚠️ PASS (Edge Too Narrow)"
+                # Buying NO means hitting the YES bid. To be a maker, we front-run the bid.
+                # If YES bid is 10¢, the NO ask is 90¢. We bid 89¢ NO (which means placing a 11¢ YES ask).
+                no_maker_price = (100 - yes_bid) - 1
                 
-            results.append({
-                "Target Market": f"{city} ≥ {target_strike}°F",
-                "Spread (Bid/Ask)": f"{best_bid}¢ / {best_ask}¢",
-                "Model P(True)": f"{prob_model:.1f}%",
-                "Execution Target": f"{exec_price}¢ [{exec_type}]",
-                "True Edge": f"{edge:+.1f}%",
-                "Quarter-Kelly": f"${bet_size:,.2f}" if bet_size > 0 else "$0.00",
-                "Verdict": verdict,
-                "_raw_edge": abs(edge),
-                "_member_temps": member_temps
-            })
-            
-        progress_bar.progress((idx + 1) / len(STATIONS))
+                if locked_in and no_maker_price <= max_no_price and no_maker_price > 0:
+                    bet_size = calculate_quarter_kelly(99.0, no_maker_price, bankroll)
+                    verdict = f"🔴 LIMIT BUY 'NO' @ {no_maker_price}¢"
+                else:
+                    bet_size = 0.0
+                    if not locked_in:
+                        verdict = "⏳ Waiting for Sun/Temp Drop"
+                    else:
+                        verdict = "⚠️ PASS (Too Expensive / Fee Trap)"
+                
+                results.append({
+                    "Market": f"{city} ≥ {floor_strike}°F",
+                    "Local Time": local_time.strftime("%I:%M %p"),
+                    "Running High": f"{running_high_f}°F",
+                    "Current Temp": f"{current_temp_f}°F",
+                    "Target Entry": f"{no_maker_price}¢",
+                    "Quarter-Kelly": f"${bet_size:,.2f}" if bet_size > 0 else "$0.00",
+                    "Verdict": verdict
+                })
+                
+        progress.progress((idx + 1) / len(STATIONS))
         
-    status_text.empty()
-    progress_bar.empty()
+    progress.empty()
     
     if results:
-        df = pd.DataFrame(results).sort_values(by="_raw_edge", ascending=False)
-        st.markdown("### 🔍 Institutional Edge Matrix")
-        st.dataframe(df.drop(columns=["_raw_edge", "_member_temps"]), use_container_width=True, hide_index=True)
-        
-        st.markdown("---")
-        st.subheader("📊 81-Member Super-Ensemble Distribution")
-        
-        top_opportunity = df.iloc[0]
-        temps = top_opportunity["_member_temps"]
-        
-        fig = px.histogram(
-            x=temps, 
-            nbins=20, 
-            title=f"ECMWF + GEFS Spread: {top_opportunity['Target Market']}",
-            labels={"x": "Projected High Temperature (°F)", "y": "Number of Ensemble Members"},
-            color_discrete_sequence=["#00BFFF"]
-        )
-        fig.add_vline(x=float(top_opportunity['Target Market'].split("≥")[1].split("°")[0]), line_dash="dash", line_color="#FF4B4B", annotation_text="Kalshi Strike", annotation_position="top right")
-        fig.update_layout(template="plotly_dark", height=400)
-        st.plotly_chart(fig, use_container_width=True)
+        df = pd.DataFrame(results)
+        st.markdown("### 🔭 Diurnal Sniper Matrix")
+        st.dataframe(df, use_container_width=True, hide_index=True)
     else:
-        st.warning("No active Kalshi order books found for tomorrow's weather markets yet. Market makers typically populate the books later in the evening.")
+        st.info("No active markets align with current diurnal metrics.")
+    
