@@ -138,14 +138,20 @@ if st.button("📡 Execute Quantitative Scan", type="primary", use_container_wid
         wx_string = str(latest_obs.get("wxString", "")).upper()
         convective_trap = any(trap in wx_string for trap in ["RA", "TS", "CB", "TCU", "DZ"])
         
-        # Advection Risk Check
-        wdir = latest_obs.get("wdir")
-        wspd = latest_obs.get("wspd")
+        # Advection Risk Check (Bulletproof Null/String Check)
+        wdir_raw = latest_obs.get("wdir")
+        wspd_raw = latest_obs.get("wspd")
         advection_risk = False
-        if wdir is not None and wspd is not None:
-            # Southerly warm winds (135° to 225°) blowing at 10+ knots
-            if 135 <= wdir <= 225 and wspd >= 10:
-                advection_risk = True
+        
+        if wdir_raw not in [None, "VRB", ""] and wspd_raw not in [None, ""]:
+            try:
+                wdir = float(wdir_raw)
+                wspd = float(wspd_raw)
+                # Southerly warm winds (135° to 225°) blowing at 10+ knots
+                if 135 <= wdir <= 225 and wspd >= 10:
+                    advection_risk = True
+            except (TypeError, ValueError):
+                pass
 
         # 2. Ingest & Filter Kalshi Markets
         markets = fetch_kalshi_markets(data["ticker"])
@@ -197,7 +203,7 @@ if st.button("📡 Execute Quantitative Scan", type="primary", use_container_wid
                 elif convective_trap:
                     verdict = f"⛈️ Convective Trap (Wx: {wx_string})"
                 elif advection_risk:
-                    verdict = f"💨 Advection Risk (Wind: {wspd}kt @ {wdir}°)"
+                    verdict = f"💨 Advection Risk (Wind: {wspd_raw}kt @ {wdir_raw}°)"
                 elif strike_barrier <= settlement_high_projected:
                     verdict = "⚠️ PASS (TWC Rounding Margin)"
                 elif target_bid > max_no_price:
